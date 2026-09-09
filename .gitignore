@@ -1,0 +1,4 @@
+node_modules/
+.env
+historical_data/
+bot-state.json

@@ -1,0 +1,22 @@
+{
+  "name": "pancake-prediction-sniper",
+  "version": "1.0.0",
+  "description": "Momentum-based bot for PancakeSwap Prediction (BNB market) - predicts round direction from live price momentum right before lock, with optional auto-betting.",
+  "type": "module",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "backtest": "node backtest.js",
+    "sweep": "node sweep.js",
+    "walkforward": "node walkforward.js",
+    "calibrate": "node calibrate.js",
+    "reset-stats": "node resetStats.js",
+    "wallet-history": "node walletHistory.js",
+    "validate": "npm run backtest && npm run calibrate && npm run sweep && npm run walkforward"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "ethers": "^6.13.2",
+    "ws": "^8.18.0"
+  }
+}
