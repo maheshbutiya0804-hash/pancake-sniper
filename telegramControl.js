@@ -40,7 +40,11 @@ async function fetchUpdates(offset, timeoutSeconds) {
   const res = await fetch(`${API_BASE}/getUpdates?timeout=${timeoutSeconds}&offset=${offset}`, {
     signal: AbortSignal.timeout((timeoutSeconds + 10) * 1000), // headroom beyond Telegram's own long-poll timeout
   });
-  if (!res.ok) throw new Error(`getUpdates returned ${res.status}`);
+  if (!res.ok) {
+    const err = new Error(`getUpdates returned ${res.status}`);
+    err.status = res.status;
+    throw err;
+  }
   const data = await res.json();
   return data.result || [];
 }
@@ -66,7 +70,11 @@ export function startTelegramControl(handlers) {
       const updates = await fetchUpdates(offset, 0);
       for (const update of updates) offset = update.update_id + 1;
     } catch (err) {
-      console.error('[telegram-control] failed to clear backlog, starting from current point anyway:', err.message);
+      if (err.status === 409) {
+        console.log('[telegram-control] another instance currently holds the update connection (expected during a deploy) - skipping backlog-clear, the main poll loop will retry on its own');
+      } else {
+        console.error('[telegram-control] failed to clear backlog, starting from current point anyway:', err.message);
+      }
     }
   }
 
@@ -95,7 +103,18 @@ export function startTelegramControl(handlers) {
           // that were never meant for the bot at all.
         }
       } catch (err) {
-        console.error('[telegram-control] poll failed, retrying in 5s:', err.message);
+        if (err.status === 409) {
+          // Telegram allows only one active getUpdates connection per bot
+          // token. A 409 means another instance is currently holding it -
+          // expected and self-resolving during a platform's zero-downtime
+          // deploy (e.g. Render/Railway briefly run the old and new
+          // instances side by side), not a real failure. It clears itself
+          // once the other instance's poll completes or that instance is
+          // terminated - no need to log this as alarming as a real error.
+          console.log('[telegram-control] another instance currently holds the update connection (expected during a deploy) - retrying in 5s');
+        } else {
+          console.error('[telegram-control] poll failed, retrying in 5s:', err.message);
+        }
         await new Promise((resolve) => setTimeout(resolve, 5000));
       }
     }

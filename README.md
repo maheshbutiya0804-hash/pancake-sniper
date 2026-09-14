@@ -370,6 +370,22 @@ to receive messages back. A real command listener there needs a persistent
 gateway connection via a much heavier library, not the plain HTTP polling
 this uses.
 
+**A `409` in the logs during a redeploy is expected, not a bug.** Telegram
+only allows one active connection per bot token. Platforms with zero-
+downtime deploys (Render and Railway both work this way) briefly run the
+old and new instances of your service side by side - sometimes up to 60
+seconds - before shutting the old one down, and Telegram's 409 is just
+surfacing that overlap. It clears itself once the old instance is
+terminated; this logs as a plain message, not an error, specifically so a
+brief spell of these during a deploy doesn't read as something wrong.
+Worth knowing this same overlap briefly affects the whole bot process, not
+just this feature - two price feeds and two decision loops run for that
+window too. This isn't a real double-betting risk (the on-chain check
+before placing any bet, plus the contract's own one-bet-per-address-per-
+round rule, both stop an actual duplicate from landing), but it's the
+reason to keep an eye on the logs right after a redeploy while running
+live, rather than assuming everything came back up in exactly one place.
+
 ## Dashboard
 
 With `ENABLE_DASHBOARD=true` (the default), a local web UI is available at
