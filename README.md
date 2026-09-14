@@ -151,7 +151,46 @@ If win rate climbs as z-score rises, the confidence measure the whole
 threshold/sizing system rests on is real. If it's flat, treat z-score as a
 pass/fail filter only, not something to size more finely against.
 
-## Wallet-copy (`ENABLE_WALLET_COPY`) - highest-priority alternative mode
+## Ensemble voting (`ENABLE_ENSEMBLE_VOTING`) - highest priority of all
+
+Instead of picking one mode exclusively, this combines whichever ones are
+enabled as independent votes and only bets when enough of them agree.
+Momentum always participates; crowd-following and wallet-copy participate
+too if their own `ENABLE_` flags are also on. Each still uses its own
+existing logic and thresholds unchanged (crowd-following still needs
+`CROWD_MIN_MARGIN_PCT` to vote at all, momentum still needs its z-score
+threshold cleared, etc.) - the only new thing is combining their verdicts.
+If at least `ENSEMBLE_MIN_AGREEMENT` agree on the same direction, that's the
+bet; otherwise the round is skipped.
+
+Example: with wallet-copy and momentum both enabled and
+`ENSEMBLE_MIN_AGREEMENT=2`, a bet only happens when the wallet you're
+following and your own momentum signal agree - if wallet-copy says BEAR and
+momentum also says BEAR, that's a bet; if they disagree, it's skipped.
+
+A few things worth knowing:
+
+- **Sizing is independent of voting.** The winning direction is bet using
+  flat `BET_AMOUNT_BNB` (or pool-sizing, if you'd rather enable that) -
+  never wallet-copy's exact amount, even when its vote is part of the
+  winning majority. Mixing "copy their direction" with "copy their size"
+  only when they happen to agree with others felt more likely to confuse
+  than help.
+- **Wallet-copy's timing changes here.** Standalone, it watches the whole
+  round since the target could bet any time. In a vote, everything has to
+  be compared at the same moment, so wallet-copy's vote only counts if the
+  target has *already* bet by the time the snipe window arrives - a late
+  bettor may frequently show up as "no vote" rather than contributing.
+- **Startup refuses an impossible config.** If `ENSEMBLE_MIN_AGREEMENT`
+  exceeds the number of voters that could ever participate (e.g. requiring
+  2 agreements with only momentum enabled), the bot won't start - that
+  config would skip every round forever, so it's better to catch it
+  immediately than have the bot quietly do nothing.
+- **Still can't be backtested** whenever crowd-following or wallet-copy are
+  among the voters, for the same reasons those modes can't be individually.
+  Dry run remains the way to evaluate this.
+
+## Wallet-copy (`ENABLE_WALLET_COPY`) - alternative mode
 
 Watches one specific wallet (`COPY_WALLET_ADDRESS`) and copies its bets
 directly: same direction, same amount (up to `COPY_WALLET_MAX_BET_BNB`, a
@@ -189,7 +228,7 @@ seconds while this runs, so it never looks stuck even when it's slow.
 Afterward it's kept current from the same polling the live copying already
 does, so it costs no extra ongoing RPC calls once loaded.
 
-## Crowd-following (`ENABLE_CROWD_FOLLOWING`) - an alternative to the signal above
+## Crowd-following (`ENABLE_CROWD_FOLLOWING`) - alternative mode
 
 This is a different mode entirely, not an add-on: instead of the momentum/
 cross-asset/oracle-divergence signal, it bets whichever side (BULL or BEAR)
@@ -273,16 +312,48 @@ pointer so the *next* attempt uses a different endpoint, but that's the
 bot's own next round or claim check, not this module silently resending.
 A single `RPC_URLS` value (or the old `RPC_URL`) works exactly as before.
 
+## Notifications (Discord/Telegram)
+
+Set `ENABLE_NOTIFICATIONS=true` plus at least one of `DISCORD_WEBHOOK_URL` or
+`TELEGRAM_BOT_TOKEN`+`TELEGRAM_CHAT_ID` to get alerts for the things you'd
+otherwise only learn by checking the dashboard yourself:
+
+- **The bot halts** (consecutive-loss or daily-loss limit reached) - the
+  exact "something's going wrong and nobody's watching" scenario that
+  matters most once this runs unattended (e.g. deployed on Railway).
+- **Startup succeeds** - confirms a redeploy or restart actually came back
+  up, and states which mode is active and whether it's DRY RUN or LIVE.
+- **A fatal crash** - both an uncaught exception/rejection and a startup
+  failure trigger this. The process waits up to 5 seconds for the
+  notification to actually send before exiting, so a real crash isn't
+  silent even if nothing's watching the logs - but it never waits longer
+  than that, so a broken or slow notification endpoint can't hang the
+  process either.
+
+Optionally, `NOTIFY_ON_BET_RESULT=true` adds a notification for every
+resolved bet (win/loss/tie). This is off by default since a bet resolves
+roughly every 5 minutes - hundreds of notifications a day if left on
+continuously. Each is tagged `[DRY RUN]` or `[LIVE]`, so it's safe to turn
+on temporarily during dry-run testing specifically to confirm your
+notification setup works, before relying on it once live.
+
+Both channels are plain HTTP calls (a Discord webhook POST, a Telegram Bot
+API call) - no SDK, no new dependency. A failed or slow notification is
+logged and never affects the actual trading logic; delivery is always
+best-effort, never something the bot's own operation depends on.
+
 ## Dashboard
 
 With `ENABLE_DASHBOARD=true` (the default), a local web UI is available at
 `http://localhost:DASHBOARD_PORT` (default 3000). The badge next to
 DRY RUN/LIVE always names which mode is actually deciding bets right now -
-**WALLET-COPY**, **CROWD-FOLLOWING**, or **MOMENTUM** - matching the exact
-priority the bot itself uses (wallet-copy beats crowd-following beats
-momentum). If more than one is configured in `.env`, only the highest-
-priority one is doing anything; the badge tells you which that is without
-needing to reason through the config yourself.
+**ENSEMBLE**, **WALLET-COPY**, **CROWD-FOLLOWING**, or **MOMENTUM** -
+matching the exact priority the bot itself uses (ensemble beats wallet-copy
+beats crowd-following beats momentum). If more than one is configured in
+`.env`, only the highest-priority one is doing anything; the badge tells you
+which that is without needing to reason through the config yourself. In
+ensemble mode, the line underneath also names which signals are actually
+voting and the agreement threshold required.
 
 The rest of the dashboard: win rate, W-L-T record,
 PnL (in BNB and, using the live Binance price, its approximate USD
@@ -346,10 +417,59 @@ Binance's API doesn't have, and would cost an impractical number of extra
 RPC calls per backtest run. Evaluate it in dry run, where every confirm/
 reject decision is logged exactly as it would be live.
 
+## Deploying somewhere other than your own machine (Railway, etc.)
+
+This runs fine on Railway or similar platforms - it's a normal long-running
+Node.js process. Two things it needs that aren't automatic, both already
+built in:
+
+- **Port**: platforms like Railway assign a port dynamically via a `PORT`
+  environment variable and expect the app to listen on it. `bot.js` already
+  prefers `PORT` over `DASHBOARD_PORT` when present, so the dashboard just
+  works once deployed - nothing to configure.
+- **Persistent state**: Railway's default filesystem is ephemeral - anything
+  written to disk is wiped on every redeploy or restart, unless you
+  explicitly attach a Volume (in the service's Volumes tab) and mount it at
+  a path. Set `STATE_FILE_PATH` to somewhere inside that mounted path (e.g.
+  `/data/bot-state.json`) so stats/PnL/pending-bet recovery actually
+  survives redeploys. Skip this and it still runs correctly - `bot-state.json`
+  just resets to zero on every redeploy, the same as deleting it manually.
+  **No funds are ever at risk from this either way** - the on-chain
+  restart-safety check (`ledger()`) is a completely separate mechanism that
+  doesn't depend on this file at all.
+
+Everything else - `.env` variables, `RPC_URLS`, `PRIVATE_KEY` - just becomes
+environment variables set through the platform's dashboard instead of a
+local `.env` file; the code reads `process.env` either way.
+
+Two things worth deciding with eyes open, not code fixes:
+
+- **You're trusting that platform with `PRIVATE_KEY`.** This is a real
+  private key with signing authority over your wallet's funds, going into a
+  third party's environment variable store rather than staying on a machine
+  you control. That's a standard thing to do for automated trading
+  bots generally, and Railway's env vars aren't exposed in logs or builds,
+  but it's a different trust boundary than running this locally, and worth
+  being deliberate about - e.g., using a wallet funded only with what
+  this bot is actively risking, not a wallet holding anything else.
+- **Continuous 24/7 operation isn't free indefinitely.** Railway bills
+  running services by resource usage after an initial trial credit - a
+  lightweight Node.js process like this should be cheap, but budget for an
+  ongoing small cost, not a permanently free deployment.
+
 ## Reliability hardening
 
-Three things worth knowing if the dashboard or bot ever seems to misbehave:
+Four things worth knowing if the dashboard or bot ever seems to misbehave:
 
+- **The bot verifies it's on the right network before making any contract
+  call.** A wrong-network RPC (e.g. accidentally pointing at a testnet, or a
+  different chain's endpoint) means `CONTRACT_ADDRESS` simply doesn't exist
+  there - every single call then fails with a cryptic `missing revert data`
+  error (`CALL_EXCEPTION`, empty data) rather than anything obviously
+  network-related. Startup now checks the connected chain ID against
+  `EXPECTED_CHAIN_ID` (56, BSC mainnet, by default) and exits with a clear
+  message immediately if they don't match, instead of that error repeating
+  on every loop tick forever.
 - **`backtest.js`, `sweep.js`, and `walletHistory.js` now detect direct
   execution correctly on Windows.** They previously compared
   `import.meta.url` against a manually-built `file://` string, which never

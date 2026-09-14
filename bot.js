@@ -10,6 +10,7 @@ import { OracleFeed } from './oracleFeed.js';
 import { startDashboard } from './dashboard.js';
 import { loadState, saveState } from './statePersistence.js';
 import { findRecentBets, withRetry, describeOutcome } from './walletHistory.js';
+import { notify, notificationChannels, notificationsAreEnabled } from './notify.js';
 
 // ---------------------------------------------------------------------------
 // Config
@@ -19,6 +20,7 @@ const {
   RPC_URLS,
   PRIVATE_KEY,
   CONTRACT_ADDRESS,
+  EXPECTED_CHAIN_ID = '56', // BSC mainnet - override only if deliberately targeting a different network (e.g. 97 for BSC testnet)
   DRY_RUN = 'true',
   BET_AMOUNT_BNB = '0.01',
   SNIPE_WINDOW_SECONDS = '10',
@@ -61,11 +63,17 @@ const {
   WALLET_HISTORY_CHUNK_SIZE = '20',
   WALLET_HISTORY_REQUEST_INTERVAL_MS = '150',
 
+  ENABLE_ENSEMBLE_VOTING = 'false',
+  ENSEMBLE_MIN_AGREEMENT = '2',
+
+  NOTIFY_ON_BET_RESULT = 'false',
+
   ENABLE_DASHBOARD = 'true',
   DASHBOARD_PORT = '3000',
 } = process.env;
 
 const isDryRun = DRY_RUN !== 'false';
+const expectedChainId = BigInt(EXPECTED_CHAIN_ID);
 const flatBetAmountWei = ethers.parseEther(BET_AMOUNT_BNB);
 const snipeWindowMs = Number(SNIPE_WINDOW_SECONDS) * 1000;
 const maxConsecutiveLosses = Number(MAX_CONSECUTIVE_LOSSES);
@@ -96,6 +104,14 @@ const oracleDivergenceThresholdPct = Number(ORACLE_DIVERGENCE_THRESHOLD_PCT);
 const crowdFollowingEnabled = ENABLE_CROWD_FOLLOWING === 'true';
 const crowdMinMarginPct = Number(CROWD_MIN_MARGIN_PCT);
 const walletCopyEnabled = ENABLE_WALLET_COPY === 'true';
+const ensembleVotingEnabled = ENABLE_ENSEMBLE_VOTING === 'true';
+const ensembleMinAgreement = Number(ENSEMBLE_MIN_AGREEMENT);
+const notifyOnBetResult = NOTIFY_ON_BET_RESULT === 'true';
+
+// Matches the EXACT priority order the decision logic itself uses - see the
+// if/else-if/else chain in the main loop. Whichever mode this names is
+// what's actually deciding bets; the other config blocks are inert.
+const activeMode = ensembleVotingEnabled ? 'ensemble' : walletCopyEnabled ? 'wallet-copy' : crowdFollowingEnabled ? 'crowd-following' : 'momentum';
 const copyWalletMaxBetWei = ethers.parseEther(COPY_WALLET_MAX_BET_BNB);
 const dashboardEnabled = ENABLE_DASHBOARD === 'true';
 
@@ -113,6 +129,22 @@ if (!rpcUrls.length || !PRIVATE_KEY || !CONTRACT_ADDRESS) {
 if (walletCopyEnabled && !ethers.isAddress(COPY_WALLET_ADDRESS)) {
   console.error(`[bot] COPY_WALLET_ADDRESS ("${COPY_WALLET_ADDRESS}") is not a valid address.`);
   process.exit(1);
+}
+
+if (ensembleVotingEnabled) {
+  // Momentum always participates; crowd/wallet-copy participate only if
+  // ALSO individually enabled. If the required agreement exceeds the number
+  // of voters that could ever show up, no round could ever win - catch that
+  // now rather than have the bot silently skip every round forever.
+  const maxPossibleVoters = 1 + (crowdFollowingEnabled ? 1 : 0) + (walletCopyEnabled ? 1 : 0);
+  if (ensembleMinAgreement > maxPossibleVoters) {
+    console.error(
+      `[bot] ENSEMBLE_MIN_AGREEMENT=${ensembleMinAgreement} but at most ${maxPossibleVoters} voter(s) can participate ` +
+      `(momentum always votes; crowd-following/wallet-copy only if their own ENABLE_ flags are also true). ` +
+      `This would skip every round forever - lower ENSEMBLE_MIN_AGREEMENT or enable more voters.`
+    );
+    process.exit(1);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -206,12 +238,14 @@ function liveHaltConditionMet() {
     logEvent(`[bot] HALTED: ${consecutiveLosses} consecutive losses (limit ${maxConsecutiveLosses})`, true);
     halted = true;
     persist();
+    notify(`🛑 Bot HALTED: ${consecutiveLosses} consecutive losses (limit ${maxConsecutiveLosses}). It will not place further bets until restarted.`);
     return true;
   }
   if (dailyLossBnb >= maxDailyLossBnb) {
     logEvent(`[bot] HALTED: daily loss ${dailyLossBnb.toFixed(4)} BNB reached the ${maxDailyLossBnb} BNB cap`, true);
     halted = true;
     persist();
+    notify(`🛑 Bot HALTED: daily loss ${dailyLossBnb.toFixed(4)} BNB reached the ${maxDailyLossBnb} BNB cap. It will not place further bets until restarted.`);
     return true;
   }
   return false;
@@ -267,6 +301,7 @@ async function checkOutcomes(rpcPool, claimManager, priceFeed) {
     else outcome = 'TIE';
 
     const tag = bet.simulated ? ' (simulated)' : '';
+    const notifyTag = bet.simulated ? '[DRY RUN] ' : '[LIVE] ';
     if (outcome === 'TIE') {
       // Confirmed against the actual contract source: a tie (closePrice ==
       // lockPrice) is the "house wins" branch - rewardAmount is set to 0 for
@@ -283,6 +318,7 @@ async function checkOutcomes(rpcPool, claimManager, priceFeed) {
         netPnlWei -= bet.amountWei;
       }
       logEvent(`[bot] epoch ${epochKey}: TIE (close == lock price) - stake lost to treasury, same as a loss${tag}`);
+      if (notifyOnBetResult) notify(`${notifyTag}Epoch ${epochKey}: TIE (house wins) - lost ${ethers.formatEther(bet.amountWei)} BNB stake`);
     } else if (outcome === bet.direction) {
       stats.wins += 1;
       // Reward ratio comes from the REAL pool either way (dry run just never
@@ -299,6 +335,7 @@ async function checkOutcomes(rpcPool, claimManager, priceFeed) {
         if (autoClaimEnabled && claimManager) claimManager.enqueue(epochKey);
       }
       logEvent(`[bot] epoch ${epochKey}: WON - bet ${bet.direction}, result ${outcome}${tag}`);
+      if (notifyOnBetResult) notify(`${notifyTag}Epoch ${epochKey}: WON - bet ${bet.direction}, profit ${ethers.formatEther(profit)} BNB`);
     } else {
       stats.losses += 1;
       if (bet.simulated) {
@@ -309,6 +346,7 @@ async function checkOutcomes(rpcPool, claimManager, priceFeed) {
         netPnlWei -= bet.amountWei;
       }
       logEvent(`[bot] epoch ${epochKey}: LOST - bet ${bet.direction}, result ${outcome}${tag}`);
+      if (notifyOnBetResult) notify(`${notifyTag}Epoch ${epochKey}: LOST - bet ${bet.direction}, result ${outcome}, lost ${ethers.formatEther(bet.amountWei)} BNB`);
     }
 
     pendingBets.delete(epochKey);
@@ -407,7 +445,10 @@ async function main() {
   console.log(`[bot] RPC endpoints: ${rpcUrls.length} configured (failover on reads, rotate-on-failure for writes)`);
   console.log(`[bot] signal: short=${signalCfg.shortLookbackSeconds}s long=${signalCfg.longLookbackSeconds}s zThreshold=${signalCfg.zScoreThreshold} crossAsset=${crossAssetEnabled ? CROSS_ASSET_SYMBOL : 'off'}`);
   console.log(`[bot] pool sizing: ${poolSizingEnabled ? `on (min payout x${sizingCfg.minPayoutMultiplier}, ${sizingCfg.betAmountMinBnb}-${sizingCfg.betAmountMaxBnb} BNB)` : `off (flat ${BET_AMOUNT_BNB} BNB)`} | auto-claim: ${autoClaimEnabled ? `on (>=${CLAIM_GAS_BUFFER_MULTIPLIER}x gas)` : 'off'}`);
-  if (walletCopyEnabled) {
+  if (ensembleVotingEnabled) {
+    const voters = ['momentum', ...(crowdFollowingEnabled ? ['crowd-following'] : []), ...(walletCopyEnabled ? ['wallet-copy'] : [])];
+    console.log(`[bot] ensemble voting: ON, need ${ensembleMinAgreement}/${voters.length} agreement among [${voters.join(', ')}] - this REPLACES the exclusive priority below (pool-sizing is bypassed while this is active)`);
+  } else if (walletCopyEnabled) {
     console.log(`[bot] wallet-copy: ON, following ${COPY_WALLET_ADDRESS} (max copy ${COPY_WALLET_MAX_BET_BNB} BNB) - this REPLACES every other signal (momentum, cross-asset, oracle-divergence, crowd-following, pool-sizing all bypassed)`);
     if (crowdFollowingEnabled) console.warn('[bot] WARNING: ENABLE_WALLET_COPY and ENABLE_CROWD_FOLLOWING are both on - wallet-copy takes priority, crowd-following is ignored.');
     if (poolSizingEnabled) console.warn('[bot] WARNING: ENABLE_WALLET_COPY and ENABLE_POOL_SIZING are both on - wallet-copy bets the target\'s exact amount, so pool sizing is ignored.');
@@ -419,6 +460,16 @@ async function main() {
   }
 
   const rpcPool = new RpcPool({ urls: rpcUrls, privateKey: PRIVATE_KEY, contractAddress: CONTRACT_ADDRESS, abi: PREDICTION_ABI });
+
+  const network = await retryStartup(() => rpcPool.withReadFailover((_c, p) => p.getNetwork()), 'network check');
+  if (network.chainId !== expectedChainId) {
+    console.error(
+      `[bot] connected RPC reports chain ID ${network.chainId}, but this bot targets chain ID ${expectedChainId} (BSC mainnet by default). ` +
+      `CONTRACT_ADDRESS won't exist on the wrong network, which shows up as a cryptic "missing revert data" error on every call, not a clear one. ` +
+      `Check RPC_URL(S) - it's very likely pointing at the wrong network (e.g. a testnet, or a different chain's endpoint).`
+    );
+    process.exit(1);
+  }
 
   const paused = await retryStartup(() => rpcPool.withReadFailover((c) => c.paused()), 'paused check');
   if (paused) {
@@ -486,7 +537,22 @@ async function main() {
     );
   }
 
+  if (notificationsAreEnabled()) {
+    const channels = notificationChannels();
+    if (channels.length) {
+      console.log(`[bot] notifications: ON via ${channels.join(' + ')}`);
+      notify(`✅ Bot started. Mode: ${activeMode}. ${isDryRun ? 'DRY RUN (no real funds at risk)' : 'LIVE (real funds at risk)'}.`);
+    } else {
+      console.warn('[bot] ENABLE_NOTIFICATIONS is true, but no DISCORD_WEBHOOK_URL or TELEGRAM_BOT_TOKEN+TELEGRAM_CHAT_ID are set - nothing will actually be sent.');
+    }
+  }
+
   if (dashboardEnabled) {
+    // Platforms like Railway assign a port dynamically via PORT and expect
+    // the app to listen on it for their networking/proxy to work - prefer
+    // that over our own DASHBOARD_PORT when it's set, so this works
+    // unmodified both locally and deployed.
+    const dashboardPort = process.env.PORT ? Number(process.env.PORT) : Number(DASHBOARD_PORT);
     startDashboard(() => {
       const bnbUsdPrice = priceFeed.getTicks().at(-1)?.price ?? null;
       const netPnlBnb = formatBnbPnl(netPnlWei);
@@ -504,11 +570,12 @@ async function main() {
       return {
         isDryRun,
         halted,
-        // Matches the EXACT priority order the decision logic itself uses -
-        // see the if/else-if/else chain in the main loop below. Whichever
-        // mode is active here is what's actually deciding bets; the other
-        // two config blocks are inert while it's active.
-        activeMode: walletCopyEnabled ? 'wallet-copy' : crowdFollowingEnabled ? 'crowd-following' : 'momentum',
+        activeMode,
+        ensembleVotingEnabled,
+        ensembleMinAgreement,
+        ensembleVoters: ensembleVotingEnabled
+          ? ['momentum', ...(crowdFollowingEnabled ? ['crowd-following'] : []), ...(walletCopyEnabled ? ['wallet-copy'] : [])]
+          : [],
         signalConfig: signalCfg,
         crossAssetEnabled,
         crossAssetSymbol: CROSS_ASSET_SYMBOL,
@@ -559,7 +626,88 @@ async function main() {
         targetWalletHistory,
         recentEvents,
       };
-    }, Number(DASHBOARD_PORT));
+    }, dashboardPort);
+  }
+
+  // ---------------------------------------------------------------------
+  // Vote getters - one per signal source. Each returns { vote: 'BULL'|
+  // 'BEAR'|null, ...details }, null meaning "no opinion this round". Used
+  // both by the exclusive standalone modes below (which use exactly one)
+  // and by ensemble mode (which combines whichever are enabled). Defined
+  // here as closures so they can reach priceFeed/crossAssetFeed/oracleFeed/
+  // rpcPool without threading them through every call.
+  // ---------------------------------------------------------------------
+
+  async function getMomentumVote() {
+    const result = decide(
+      priceFeed.getTicks(),
+      Date.now(),
+      signalCfg,
+      crossAssetFeed ? crossAssetFeed.getTicks() : null
+    );
+
+    if (result.action === 'SKIP') {
+      return { vote: null, reason: result.reason, result };
+    }
+
+    if (oracleDivergenceEnabled) {
+      const latestTick = priceFeed.getTicks().at(-1);
+      const divergence = oracleFeed.divergencePct(latestTick?.price);
+      if (divergence == null) {
+        return { vote: null, reason: 'oracle not ready', result };
+      }
+      const expectedSign = result.action === 'BULL' ? 1 : -1;
+      const divergenceConfirms = Math.sign(divergence) === expectedSign && Math.abs(divergence) >= oracleDivergenceThresholdPct;
+      const staleness = oracleFeed.secondsSinceUpdate();
+      if (!divergenceConfirms) {
+        return { vote: null, reason: 'oracle does not confirm', result, divergence, staleness };
+      }
+      return { vote: result.action, result, divergence, staleness };
+    }
+
+    return { vote: result.action, result };
+  }
+
+  function getCrowdVote(round) {
+    const totalAmount = round.bullAmount + round.bearAmount;
+    if (totalAmount === 0n) {
+      return { vote: null, reason: 'no bets yet' };
+    }
+    // Basis-point BigInt division first, then scale down - avoids float
+    // precision loss converting large wei amounts before dividing.
+    const bullPct = Number((round.bullAmount * 10000n) / totalAmount) / 100;
+    const bearPct = 100 - bullPct;
+    if (Math.abs(bullPct - bearPct) < crowdMinMarginPct) {
+      return { vote: null, reason: 'margin too thin', bullPct, bearPct };
+    }
+    return { vote: bullPct > bearPct ? 'BULL' : 'BEAR', bullPct, bearPct };
+  }
+
+  async function getWalletCopyVote(round) {
+    let targetLedger;
+    try {
+      targetLedger = await rpcPool.withReadFailover((c) => c.ledger(round.epoch, COPY_WALLET_ADDRESS));
+    } catch (err) {
+      return { vote: null, reason: 'check failed', error: err };
+    }
+    if (targetLedger.amount === 0n) {
+      return { vote: null, reason: 'no bet yet' };
+    }
+    const vote = Number(targetLedger.position) === 0 ? 'BULL' : 'BEAR';
+
+    // Record what the target ACTUALLY did in the dashboard's reference
+    // table, independent of whether this vote ends up winning (standalone
+    // mode) or being outvoted (ensemble mode) - reflects their real
+    // behavior, not our decision.
+    targetWalletHistory.unshift({
+      epoch: round.epoch.toString(),
+      direction: vote,
+      amountBnb: ethers.formatEther(targetLedger.amount),
+      outcome: 'PENDING (round not resolved yet)',
+    });
+    if (targetWalletHistory.length > 10) targetWalletHistory.length = 10;
+
+    return { vote, targetLedger };
   }
 
   setInterval(async () => {
@@ -604,29 +752,48 @@ async function main() {
       let direction;
       let amountWei;
 
-      if (walletCopyEnabled) {
+      if (ensembleVotingEnabled) {
+        if (!withinSnipeWindow) return;
+
+        const momentumVote = await getMomentumVote();
+        // Transient startup conditions (not enough price history yet) - not
+        // a genuine "momentum has no opinion" verdict, so retry next tick
+        // rather than burning this round's one decision slot.
+        if (momentumVote.reason === 'insufficient data' || momentumVote.reason === 'insufficient cross-asset data') return;
+
+        const votes = [{ source: 'momentum', ...momentumVote }];
+        if (crowdFollowingEnabled) votes.push({ source: 'crowd', ...getCrowdVote(round) });
+        if (walletCopyEnabled) votes.push({ source: 'wallet-copy', ...(await getWalletCopyVote(round)) });
+
+        const describeVote = (v) => v.vote ? `${v.source}=${v.vote}` : `${v.source}=skip(${v.reason})`;
+        const summary = votes.map(describeVote).join(', ');
+        const bullCount = votes.filter((v) => v.vote === 'BULL').length;
+        const bearCount = votes.filter((v) => v.vote === 'BEAR').length;
+
+        decidedEpochs.add(epochKey);
+
+        if (bullCount >= ensembleMinAgreement) {
+          direction = 'BULL';
+          logEvent(`[bot] epoch ${epochKey}: ensemble -> BULL (${bullCount}/${votes.length} agree) - ${summary}`);
+        } else if (bearCount >= ensembleMinAgreement) {
+          direction = 'BEAR';
+          logEvent(`[bot] epoch ${epochKey}: ensemble -> BEAR (${bearCount}/${votes.length} agree) - ${summary}`);
+        } else {
+          logEvent(`[bot] epoch ${epochKey}: ensemble - no agreement (need ${ensembleMinAgreement}/${votes.length}) - ${summary}`);
+          stats.skipped += 1;
+          return;
+        }
+      } else if (walletCopyEnabled) {
         if (secondsToLock <= 0) return; // already locked, nothing left to copy into
-        let targetLedger;
-        try {
-          targetLedger = await rpcPool.withReadFailover((c) => c.ledger(round.epoch, COPY_WALLET_ADDRESS));
-        } catch (err) {
-          console.error(`[bot] failed checking target wallet for epoch ${epochKey}:`, err.message);
+        const voteResult = await getWalletCopyVote(round);
+        if (voteResult.reason === 'check failed') {
+          console.error(`[bot] failed checking target wallet for epoch ${epochKey}:`, voteResult.error.message);
           return; // retry next tick
         }
-        if (targetLedger.amount === 0n) return; // hasn't bet yet this round - keep watching
+        if (voteResult.vote == null) return; // hasn't bet yet this round - keep watching
         decidedEpochs.add(epochKey);
-        direction = Number(targetLedger.position) === 0 ? 'BULL' : 'BEAR';
-
-        // Record in the dashboard's history list using the target's REAL
-        // amount (not our capped copy amount below) - this reflects what
-        // they actually did, separate from what we chose to mirror.
-        targetWalletHistory.unshift({
-          epoch: epochKey,
-          direction,
-          amountBnb: ethers.formatEther(targetLedger.amount),
-          outcome: 'PENDING (round not resolved yet)',
-        });
-        if (targetWalletHistory.length > 10) targetWalletHistory.length = 10;
+        direction = voteResult.vote;
+        const targetLedger = voteResult.targetLedger;
 
         if (targetLedger.amount > copyWalletMaxBetWei) {
           logEvent(`[bot] epoch ${epochKey}: target wallet bet ${direction} for ${ethers.formatEther(targetLedger.amount)} BNB - capping our copy at ${COPY_WALLET_MAX_BET_BNB} BNB`);
@@ -637,71 +804,49 @@ async function main() {
         }
       } else if (crowdFollowingEnabled) {
         if (!withinSnipeWindow) return;
-        const totalAmount = round.bullAmount + round.bearAmount;
-        if (totalAmount === 0n) {
-          decidedEpochs.add(epochKey);
-          logEvent(`[bot] epoch ${epochKey}: no bets in the pool yet - skipping (crowd-following)`);
-          stats.skipped += 1;
-          return;
-        }
-        // Basis-point BigInt division first, then scale down - avoids float
-        // precision loss converting large wei amounts before dividing.
-        const bullPct = Number((round.bullAmount * 10000n) / totalAmount) / 100;
-        const bearPct = 100 - bullPct;
-        const marginPct = Math.abs(bullPct - bearPct);
+        const voteResult = getCrowdVote(round);
         decidedEpochs.add(epochKey);
-        if (marginPct < crowdMinMarginPct) {
-          logEvent(`[bot] epoch ${epochKey}: pool split ${bullPct.toFixed(1)}% / ${bearPct.toFixed(1)}% - margin below ${crowdMinMarginPct}% minimum, skipping`);
+        if (voteResult.vote == null) {
+          const msg = voteResult.reason === 'no bets yet'
+            ? `[bot] epoch ${epochKey}: no bets in the pool yet - skipping (crowd-following)`
+            : `[bot] epoch ${epochKey}: pool split ${voteResult.bullPct.toFixed(1)}% / ${voteResult.bearPct.toFixed(1)}% - margin below ${crowdMinMarginPct}% minimum, skipping`;
+          logEvent(msg);
           stats.skipped += 1;
           return;
         }
-        direction = bullPct > bearPct ? 'BULL' : 'BEAR';
-        logEvent(`[bot] epoch ${epochKey}: pool split ${bullPct.toFixed(1)}% / ${bearPct.toFixed(1)}% -> following the crowd into ${direction}`);
+        direction = voteResult.vote;
+        logEvent(`[bot] epoch ${epochKey}: pool split ${voteResult.bullPct.toFixed(1)}% / ${voteResult.bearPct.toFixed(1)}% -> following the crowd into ${direction}`);
       } else {
         if (!withinSnipeWindow) return;
-        const result = decide(
-          priceFeed.getTicks(),
-          Date.now(),
-          signalCfg,
-          crossAssetFeed ? crossAssetFeed.getTicks() : null
-        );
+        const voteResult = await getMomentumVote();
+        const result = voteResult.result;
 
-        if (result.action === 'SKIP') {
+        if (voteResult.vote == null) {
           // Transient startup conditions - don't burn the round's decision slot, just wait for data.
-          if (result.reason === 'insufficient data' || result.reason === 'insufficient cross-asset data') return;
+          if (voteResult.reason === 'insufficient data' || voteResult.reason === 'insufficient cross-asset data') return;
           decidedEpochs.add(epochKey);
           stats.skipped += 1;
-          logEvent(`[bot] epoch ${epochKey}: skip (${result.reason}) - short ${result.short?.pctChange.toFixed(4)}% / long ${result.long?.pctChange.toFixed(4)}%`);
+          if (voteResult.reason === 'oracle not ready') {
+            logEvent(`[bot] epoch ${epochKey}: oracle reading not available yet, skipping`);
+          } else if (voteResult.reason === 'oracle does not confirm') {
+            logEvent(`[bot] epoch ${epochKey}: ${result.action} from momentum, but oracle divergence (${voteResult.divergence.toFixed(4)}%, oracle ${voteResult.staleness.toFixed(1)}s stale) doesn't confirm - skipping`);
+          } else {
+            logEvent(`[bot] epoch ${epochKey}: skip (${voteResult.reason}) - short ${result.short?.pctChange.toFixed(4)}% / long ${result.long?.pctChange.toFixed(4)}%`);
+          }
           return;
         }
 
         decidedEpochs.add(epochKey);
-        direction = result.action;
+        direction = voteResult.vote;
 
         if (oracleDivergenceEnabled) {
-          const latestTick = priceFeed.getTicks().at(-1);
-          const divergence = oracleFeed.divergencePct(latestTick?.price);
-          if (divergence == null) {
-            logEvent(`[bot] epoch ${epochKey}: oracle reading not available yet, skipping`);
-            stats.skipped += 1;
-            return;
-          }
-          const expectedSign = direction === 'BULL' ? 1 : -1;
-          const divergenceConfirms = Math.sign(divergence) === expectedSign && Math.abs(divergence) >= oracleDivergenceThresholdPct;
-          const staleness = oracleFeed.secondsSinceUpdate().toFixed(1);
-          if (!divergenceConfirms) {
-            logEvent(`[bot] epoch ${epochKey}: ${direction} from momentum, but oracle divergence (${divergence.toFixed(4)}%, oracle ${staleness}s stale) doesn't confirm - skipping`);
-            stats.skipped += 1;
-            return;
-          }
-          logEvent(`[bot] epoch ${epochKey}: oracle divergence ${divergence.toFixed(4)}% confirms ${direction} (oracle ${staleness}s stale)`);
+          logEvent(`[bot] epoch ${epochKey}: oracle divergence ${voteResult.divergence.toFixed(4)}% confirms ${direction} (oracle ${voteResult.staleness.toFixed(1)}s stale)`);
         }
-
         logEvent(`[bot] epoch ${epochKey}: locks in ${secondsToLock}s -> ${direction} (short ${result.short.pctChange.toFixed(4)}%, long ${result.long.pctChange.toFixed(4)}%, z=${result.zScore.toFixed(2)})`);
       }
 
       if (amountWei === undefined) amountWei = flatBetAmountWei; // wallet-copy already set its own amount above
-      if (poolSizingEnabled && !crowdFollowingEnabled && !walletCopyEnabled) {
+      if (poolSizingEnabled && !crowdFollowingEnabled && !walletCopyEnabled && !ensembleVotingEnabled) {
         const multiplier = impliedPayoutMultiplier({
           bullAmount: round.bullAmount,
           bearAmount: round.bearAmount,
@@ -746,7 +891,25 @@ async function main() {
   }, Number(POLL_INTERVAL_MS));
 }
 
-main().catch((err) => {
+main().catch(async (err) => {
   console.error('[bot] fatal error:', err);
+  await notify(`🔴 Bot CRASHED during startup: ${err.message}`);
+  process.exit(1);
+});
+
+// Safety net for anything that escapes the main loop's own try/catch (which
+// already handles ordinary operational errors without crashing) - a bug in
+// error-handling itself, or a synchronous throw from a library outside any
+// try/catch. Without these, such a crash would be completely silent to
+// anyone not actively watching logs.
+process.on('uncaughtException', async (err) => {
+  console.error('[bot] FATAL uncaught exception:', err);
+  await notify(`🔴 Bot CRASHED (uncaught exception): ${err.message}`);
+  process.exit(1);
+});
+
+process.on('unhandledRejection', async (reason) => {
+  console.error('[bot] FATAL unhandled rejection:', reason);
+  await notify(`🔴 Bot CRASHED (unhandled rejection): ${reason?.message || reason}`);
   process.exit(1);
 });

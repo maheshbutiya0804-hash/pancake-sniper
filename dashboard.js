@@ -103,7 +103,8 @@ async function refresh() {
     const s = await res.json();
     warningEl.style.display = 'none';
 
-    const modeBadgeText = s.activeMode === 'wallet-copy' ? 'WALLET-COPY'
+    const modeBadgeText = s.activeMode === 'ensemble' ? 'ENSEMBLE'
+      : s.activeMode === 'wallet-copy' ? 'WALLET-COPY'
       : s.activeMode === 'crowd-following' ? 'CROWD-FOLLOWING'
       : 'MOMENTUM';
 
@@ -113,7 +114,9 @@ async function refresh() {
       (s.halted ? '<span class="badge halted">HALTED</span>' : '');
 
     let configLine;
-    if (s.activeMode === 'wallet-copy') {
+    if (s.activeMode === 'ensemble') {
+      configLine = 'Combining ' + s.ensembleVoters.join(' + ') + ' - needs ' + s.ensembleMinAgreement + '/' + s.ensembleVoters.length + ' agreement to bet, otherwise skips.';
+    } else if (s.activeMode === 'wallet-copy') {
       configLine = 'Following ' + s.copyWalletAddress + ' - every other signal (momentum, cross-asset, oracle, crowd-following, pool-sizing) is bypassed while this is active.';
     } else if (s.activeMode === 'crowd-following') {
       configLine = 'Betting whichever side has more money in the pool (min margin ' + s.crowdMinMarginPct + '%) - momentum/cross-asset/oracle/pool-sizing are bypassed while this is active.';
