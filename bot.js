@@ -11,6 +11,7 @@ import { startDashboard } from './dashboard.js';
 import { loadState, saveState } from './statePersistence.js';
 import { findRecentBets, withRetry, describeOutcome } from './walletHistory.js';
 import { notify, notificationChannels, notificationsAreEnabled } from './notify.js';
+import { startTelegramControl, telegramControlIsEnabled } from './telegramControl.js';
 
 // ---------------------------------------------------------------------------
 // Config
@@ -67,6 +68,7 @@ const {
   ENSEMBLE_MIN_AGREEMENT = '2',
 
   NOTIFY_ON_BET_RESULT = 'false',
+  ENABLE_TELEGRAM_CONTROL = 'false',
 
   ENABLE_DASHBOARD = 'true',
   DASHBOARD_PORT = '3000',
@@ -157,6 +159,7 @@ let consecutiveLosses = 0;
 let dailyLossBnb = 0;
 let dayStart = Date.now();
 let halted = false;
+let manuallyPaused = false; // toggled by /stop and /start via Telegram - see telegramControl.js
 const stats = { wins: 0, losses: 0, ties: 0, skipped: 0 };
 let netPnlWei = 0n;       // real money - only moves for live (non-simulated) bets
 let simulatedPnlWei = 0n; // dry-run paper PnL, computed from the REAL pool's reward ratio
@@ -193,6 +196,7 @@ function persist() {
     dayStart,
     consecutiveLosses,
     halted,
+    manuallyPaused,
     // Explicit field list (not a spread) - the in-memory bet objects also
     // carry transient display-cache fields (current pool amounts, as
     // BigInt) that must never reach JSON.stringify unconverted.
@@ -216,12 +220,13 @@ function restoreState() {
   dayStart = loaded.dayStart ?? Date.now();
   consecutiveLosses = loaded.consecutiveLosses ?? 0;
   halted = loaded.halted ?? false;
+  manuallyPaused = loaded.manuallyPaused ?? false;
   for (const [epoch, bet] of loaded.pendingBets ?? []) {
     pendingBets.set(epoch, { ...bet, amountWei: BigInt(bet.amountWei) });
     decidedEpochs.add(epoch); // we already have a position on this round, don't re-decide it
   }
   const pendingNote = pendingBets.size ? `, ${pendingBets.size} pending bet(s) recovered` : '';
-  console.log(`[bot] restored persisted state: ${stats.wins}W/${stats.losses}L/${stats.ties}T${pendingNote}${halted ? ' (was HALTED)' : ''}`);
+  console.log(`[bot] restored persisted state: ${stats.wins}W/${stats.losses}L/${stats.ties}T${pendingNote}${halted ? ' (was HALTED)' : ''}${manuallyPaused ? ' (was manually PAUSED via Telegram)' : ''}`);
 }
 
 function resetDailyCounterIfNeeded() {
@@ -547,6 +552,48 @@ async function main() {
     }
   }
 
+  if (telegramControlIsEnabled()) {
+    console.log('[bot] telegram control: ON (/stats, /stop, /start)');
+    startTelegramControl({
+      getStatsText: () => {
+        const total = stats.wins + stats.losses;
+        const rate = total ? ((stats.wins / total) * 100).toFixed(1) : '0.0';
+        const pnlWei = isDryRun ? simulatedPnlWei : netPnlWei;
+        const pnlBnb = formatBnbPnl(pnlWei);
+        const bnbUsdPrice = priceFeed.getTicks().at(-1)?.price ?? null;
+        const pnlUsdBit = bnbUsdPrice != null ? ` (~$${(parseFloat(pnlBnb) * bnbUsdPrice).toFixed(2)})` : '';
+        const pnlLabel = isDryRun ? 'Simulated PnL' : 'Live net PnL';
+        let statusLine;
+        if (halted) statusLine = '🛑 HALTED (loss limit reached) - resume with npm run reset-stats, not /start';
+        else if (manuallyPaused) statusLine = '⏸️ Paused via /stop - send /start to resume';
+        else statusLine = '▶️ Running normally';
+        return [
+          `Mode: ${activeMode}`,
+          isDryRun ? 'DRY RUN (no funds at risk)' : 'LIVE (real funds at risk)',
+          `Record: ${stats.wins}W / ${stats.losses}L / ${stats.ties}T (${rate}% win rate)`,
+          `${pnlLabel}: ${pnlBnb} BNB${pnlUsdBit}`,
+          `Pending bets: ${pendingBets.size}`,
+          `Status: ${statusLine}`,
+        ].join('\n');
+      },
+      onStop: () => {
+        if (manuallyPaused) return 'Already paused.';
+        manuallyPaused = true;
+        persist();
+        logEvent('[bot] paused via /stop (Telegram)');
+        return '⏸️ Paused. No new bets will be placed. Send /start to resume.';
+      },
+      onStart: () => {
+        if (halted) return '🛑 Cannot resume via Telegram - halted from a loss limit. Review your config, then run `npm run reset-stats` and restart the bot.';
+        if (!manuallyPaused) return 'Already running - nothing to resume.';
+        manuallyPaused = false;
+        persist();
+        logEvent('[bot] resumed via /start (Telegram)');
+        return '▶️ Resumed. Betting will continue normally.';
+      },
+    });
+  }
+
   if (dashboardEnabled) {
     // Platforms like Railway assign a port dynamically via PORT and expect
     // the app to listen on it for their networking/proxy to work - prefer
@@ -570,6 +617,7 @@ async function main() {
       return {
         isDryRun,
         halted,
+        manuallyPaused,
         activeMode,
         ensembleVotingEnabled,
         ensembleMinAgreement,
@@ -719,6 +767,7 @@ async function main() {
       }
 
       if (liveHaltConditionMet()) return;
+      if (manuallyPaused) return;
 
       const round = await rpcPool.withReadFailover(getCurrentRound);
       latestRound = round;

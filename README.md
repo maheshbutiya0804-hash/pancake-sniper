@@ -103,7 +103,7 @@ Four checks, all in `signal.js`, all must pass:
 
 ## Backtesting and tuning
 
-**`npm run validate` runs the full sequence in one command** -
+**`npm run validate-strategy` runs the full sequence in one command** -
 `backtest` → `calibrate` → `sweep` → `walkforward`, in that order, stopping
 immediately if any step fails rather than continuing on bad data. Each
 script still does its own historical data fetch (they don't share one
@@ -342,6 +342,34 @@ API call) - no SDK, no new dependency. A failed or slow notification is
 logged and never affects the actual trading logic; delivery is always
 best-effort, never something the bot's own operation depends on.
 
+## Telegram remote control (`ENABLE_TELEGRAM_CONTROL`)
+
+Adds three commands to the same Telegram bot notifications already use -
+no separate setup beyond turning this on:
+
+- **`/stats`** - current mode, dry-run/live status, win rate, PnL, pending
+  bet count, and whether it's paused or halted.
+- **`/stop`** - pauses new betting decisions. The price feed, dashboard,
+  and this command listener all keep running, and any bet already placed
+  still resolves and claims normally - only new decisions stop.
+- **`/start`** - resumes after `/stop`.
+
+Only messages from `TELEGRAM_CHAT_ID` are ever acted on - a message from
+anyone else who happens to message your bot is silently ignored, not
+replied to, since this can pause and resume live betting.
+
+**`/start` will not clear a safety halt** from `MAX_CONSECUTIVE_LOSSES` or
+`MAX_DAILY_LOSS_BNB` - it replies explaining that and pointing at
+`npm run reset-stats` instead, the same deliberate step required today.
+Pausing the bot is meant to be easy and reversible; overriding a loss limit
+you configured for yourself with a single quick text message is not
+something worth making equally easy.
+
+This is Telegram-only - Discord doesn't have an equivalent lightweight way
+to receive messages back. A real command listener there needs a persistent
+gateway connection via a much heavier library, not the plain HTTP polling
+this uses.
+
 ## Dashboard
 
 With `ENABLE_DASHBOARD=true` (the default), a local web UI is available at
@@ -420,9 +448,19 @@ reject decision is logged exactly as it would be live.
 ## Deploying somewhere other than your own machine (Railway, etc.)
 
 This runs fine on Railway or similar platforms - it's a normal long-running
-Node.js process. Two things it needs that aren't automatic, both already
-built in:
+Node.js process. One thing to set explicitly, and two things it needs that
+aren't automatic but are already built in:
 
+- **Set the build command to nothing (or just leave it blank) in your
+  service's settings.** Railway's auto-detection sometimes picks a script
+  from `package.json` to run as a "build" step, and this project doesn't
+  have or need one - everything here is plain Node.js with no compilation.
+  If left on a wrong auto-detected guess, this can run scripts that expect
+  live market data (`backtest`, `sweep`, etc.) during the *build* phase
+  instead of when you actually run them, in a build environment that may
+  not even have working network access to the services they call. Clearing
+  the build command override in your service's Settings avoids this
+  entirely - `npm install` followed by `npm start` is all this needs.
 - **Port**: platforms like Railway assign a port dynamically via a `PORT`
   environment variable and expect the app to listen on it. `bot.js` already
   prefers `PORT` over `DASHBOARD_PORT` when present, so the dashboard just

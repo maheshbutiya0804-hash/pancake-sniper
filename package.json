@@ -12,7 +12,7 @@
     "calibrate": "node calibrate.js",
     "reset-stats": "node resetStats.js",
     "wallet-history": "node walletHistory.js",
-    "validate": "npm run backtest && npm run calibrate && npm run sweep && npm run walkforward"
+    "validate-strategy": "npm run backtest && npm run calibrate && npm run sweep && npm run walkforward"
   },
   "dependencies": {
     "dotenv": "^16.4.5",

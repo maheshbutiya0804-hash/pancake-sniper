@@ -111,7 +111,8 @@ async function refresh() {
     document.getElementById('status-line').innerHTML =
       '<span class="badge ' + (s.isDryRun ? 'dry' : 'live') + '">' + (s.isDryRun ? 'DRY RUN' : 'LIVE') + '</span>' +
       '<span class="badge mode">' + modeBadgeText + '</span>' +
-      (s.halted ? '<span class="badge halted">HALTED</span>' : '');
+      (s.halted ? '<span class="badge halted">HALTED</span>' : '') +
+      (s.manuallyPaused ? '<span class="badge halted">PAUSED (Telegram)</span>' : '');
 
     let configLine;
     if (s.activeMode === 'ensemble') {
